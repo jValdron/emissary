@@ -113,6 +113,10 @@ main() {
 	local tag
 	tag=$(print-tag)
 
+	# `archs` is a list of architectures to build the image for.
+	#
+	local archs=("amd64" "arm64")
+
 	# `repos` is a list of Docker repos where the base-python image
 	# gets pulled-from/pushed-to.
 	#
@@ -157,53 +161,69 @@ main() {
 	add_repo 'docker.io/emissaryingress/base-python'
 
 	# Download
-	local id=''
-	for repo in "${repos[@]}"; do
-		stat_busy 'Checking if %q exists locally' "$repo:$tag"
-		if docker image inspect "$repo:$tag" &>/dev/null; then
-			stat_done "${GRN}yes"
-			id=$(docker image inspect "$repo:$tag" --format='{{.Id}}')
-			break
-		fi
-		stat_done "${RED}no"
+	local digest=''
+	# for repo in "${repos[@]}"; do
+	# 	stat_busy 'Checking if %q exists locally' "$repo:$tag"
+	# 	if docker image inspect "$repo:$tag" &>/dev/null; then
+	# 		stat_done "${GRN}yes"
+	# 		digest=$(docker buildx imagetools inspect "$repo:$tag" --format='{{json .Manifest.Digest}}')
+	# 		break
+	# 	fi
+	# 	stat_done "${RED}no"
 
-		stat_busy 'Checking if %q can be pulled' "$repo:$tag"
-		if docker pull "$repo:$tag" &>/dev/null; then
-			stat_done "${GRN}yes"
-			id=$(docker image inspect "$repo:$tag" --format='{{.Id}}')
-			break
-		fi
-		stat_done "${RED}no"
-	done
+	# 	stat_busy 'Checking if %q can be pulled' "$repo:$tag"
+	# 	if docker pull "$repo:$tag" &>/dev/null; then
+	# 		stat_done "${GRN}yes"
+	# 		digest=$(docker buildx imagetools inspect "$repo:$tag" --format='{{json .Manifest.Digest}}')
+	# 		break
+	# 	fi
+	# 	stat_done "${RED}no"
+	# done
 
-	if [[ -z "$id" ]]; then
+	digest=""
+
+	if [[ -z "$digest" ]]; then
 		# Build
-		statnl_busy 'Building %q locally' "base-python:$tag"
-		iidfile=$(mktemp)
-		trap 'rm -f "$iidfile"' RETURN
-		docker build --iidfile="$iidfile" docker/base-python >&2
-		id=$(cat "$iidfile")
+		for arch in "${archs[@]}"; do
+			statnl_busy 'Building %q locally' "base-python:$tag-$arch"
+			docker buildx build --no-cache --load --tag="base-python:$tag-$arch" --platform="linux/$arch" docker/base-python >&2
+		done
 		statnl_done 'done building'
 
 		# Push
-		pushed=0
+		manifests_pushed=0
 		for repo in "${repos[@]}"; do
-			statnl_busy 'Attempting to push %q' "$repo:$tag"
-			docker tag "$id" "$repo:$tag" >&2
-			if docker push "$repo:$tag" >&2; then
-				statnl_done "${GRN}pushed"
-				pushed=1
-				continue
+			statnl_busy 'Attempting to push to %q' "$repo"
+			pushed=0
+			tags=()
+			for arch in "${archs[@]}"; do
+				statnl_busy 'Attempting to push %q' "$repo:$tag-$arch"
+				docker tag "base-python:$tag-$arch" "$repo:$tag-$arch" >&2
+				if docker push "$repo:$tag-$arch" >&2; then
+					tags+=("$repo:$tag-$arch")
+					((pushed++))
+				fi
+			done
+
+			# Push manifest (multi-platform)
+			if (($pushed >= ${#archs[@]})); then
+				statnl_busy 'Attempting to push multi-platform manifest %q' "$repo:$tag"
+				docker manifest create --amend "$repo:$tag" "${tags[@]}" >&2
+				if docker manifest push "$repo:$tag" >&2; then
+					statnl_done "${GRN}pushed"
+					manifests_pushed=1
+					continue
+				fi
 			fi
 			statnl_done "${RED}failed to push"
 		done
-		if ! (( pushed )); then
+		if ! (( manifests_pushed )); then
 			error "Could not push locally-built image to any remote repositories"
 			return 1
 		fi
 	fi
 
-	printf '%s\n' "$id"
+	printf '%s\n' "$digest"
 }
 
 main "$@"
